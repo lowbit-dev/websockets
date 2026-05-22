@@ -40,16 +40,18 @@ func TestDeflateWrapper_CompressedAndUncompressed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to read compressed frame: %v", err)
 	}
+
 	if op != websockets.OpCodeText || string(payload) != "compressed data payload" {
 		t.Errorf("failed to accurately inflate data, got: %s", string(payload))
 	}
 
 	// Test Path B: Read Uncompressed message on same connection
 	buf = buf[:0]
-	payload, op, err = serverDeflate.ReadMessage(buf)
+	payload, _, err = serverDeflate.ReadMessage(buf)
 	if err != nil {
 		t.Fatalf("failed to read subsequent uncompressed frame: %v", err)
 	}
+
 	if string(payload) != "raw uncompressed" {
 		t.Errorf("deflate wrapper broken when processing uncompressed bypass, got: %s", string(payload))
 	}
