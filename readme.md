@@ -1,4 +1,4 @@
-# websockets
+# WebSockets
 
 [![Go Report Card](https://goreportcard.com/badge/lowbit.dev/websockets)](https://goreportcard.com/report/lowbit.dev/websockets)[![Go Reference](https://pkg.go.dev/badge/lowbit.dev/websockets.svg)](https://pkg.go.dev/lowbit.dev/websockets) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
