@@ -18,6 +18,7 @@ type ConnPool struct {
 
 func NewConnPool(maxReadLimit, maxFrameSize int64) *ConnPool {
 	p := &ConnPool{
+		maxReadLimit: maxReadLimit,
 		maxFrameSize: maxFrameSize,
 		writePool: *NewTypedPool(func() *[]byte {
 			b := make([]byte, 14+maxFrameSize)
