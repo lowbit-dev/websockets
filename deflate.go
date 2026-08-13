@@ -50,41 +50,57 @@ type Compressor interface {
 	io.Writer
 	Flush() error
 	Reset(w io.Writer)
+	Close() error
 }
 
 // PerMessageDeflateConn wraps a base Conn to handle transparent RFC 7692 compression.
 // It recycles an internal scratch buffer to keep reading paths allocation-efficient.
 type PerMessageDeflateConn struct {
-	c          *Conn
-	compBuf    bytes.Buffer
-	compressor Compressor
+	*Conn
 
-	compressed   []byte
-	decompressor io.ReadCloser
+	// shared between pooled and standalone
+	compressed []byte
+
+	// Standalone opperation
+	boundBuffer       *bytes.Buffer
+	boundCompressor   Compressor
+	boundDecompressor io.ReadCloser
+
+	// pooled opperation
+	compBufPool      *TypedPool[bytes.Buffer]
+	compressorPool   *TypedPool[Compressor]
+	decompressorPool *TypedPool[io.ReadCloser]
 }
 
 // WrapDeflate decorates a base connection with a DEFLATE compression layer.
 // It initializes the flate compression engine with the specified compression level.
 func WrapDeflate(conn *Conn, compressionLevel int) (*PerMessageDeflateConn, error) {
+	if compressionLevel == 0 {
+		compressionLevel = flate.DefaultCompression
+	}
+
 	dw, err := flate.NewWriter(nil, compressionLevel)
 	if err != nil {
 		return nil, err
 	}
 
 	return &PerMessageDeflateConn{
-		c:          conn,
-		compressor: dw,
-		compressed: make([]byte, 0, 1024),
+		Conn:              conn,
+		boundCompressor:   dw,
+		boundDecompressor: flate.NewReader(bytes.NewReader(nil)),
+		boundBuffer:       &bytes.Buffer{},
+		compressed:        make([]byte, 0, 1024),
 	}, nil
 }
 
 // WrapDeflateWithCompressor allows for injecting an alternative hardware-accelerated compressor
 // conforming to the Compressor interface.
-func WrapDeflateWithCompresor(conn *Conn, compressor Compressor) (*PerMessageDeflateConn, error) {
+func WrapDeflateWithCompressor(conn *Conn, compressor Compressor) (*PerMessageDeflateConn, error) {
 	return &PerMessageDeflateConn{
-		c:          conn,
-		compressor: compressor,
-		compressed: make([]byte, 0, 1024),
+		Conn:            conn,
+		boundCompressor: compressor,
+		boundBuffer:     &bytes.Buffer{},
+		compressed:      make([]byte, 0, 1024),
 	}, nil
 }
 
@@ -96,7 +112,7 @@ func (dc *PerMessageDeflateConn) ReadMessage(buf []byte) ([]byte, OpCode, error)
 	var op OpCode
 	var err error
 
-	dc.compressed, op, rsv, err = dc.c.ReadMessageExt(dc.compressed)
+	dc.compressed, op, rsv, err = dc.Conn.ReadMessageExt(dc.compressed)
 	if err != nil {
 		return buf, 0, err
 	}
@@ -114,20 +130,22 @@ func (dc *PerMessageDeflateConn) ReadMessage(buf []byte) ([]byte, OpCode, error)
 
 	r := bytes.NewReader(dc.compressed)
 
-	if dc.decompressor == nil {
-		dc.decompressor = flate.NewReader(r)
-	} else {
-		dc.decompressor.(flate.Resetter).Reset(r, nil)
+	decompressor, decompressorPtr := dc.acquireDecompressor()
+	defer dc.releaseDecompressor(decompressorPtr)
+
+	if resetter, ok := decompressor.(flate.Resetter); ok {
+		if err := resetter.Reset(r, nil); err != nil {
+			return buf, op, fmt.Errorf("%w: %w", ErrFailedResetDecompressor, err)
+		}
 	}
 
-	// 2. Pure, un-compromised loop logic. True errors will bubble up naturally.
 	for {
 		start := len(buf)
 		if cap(buf) == start {
 			buf = slices.Grow(buf, 1024)
 		}
 
-		n, readErr := dc.decompressor.Read(buf[start:cap(buf)])
+		n, readErr := decompressor.Read(buf[start:cap(buf)])
 		buf = buf[:start+n]
 
 		if readErr == io.EOF {
@@ -146,20 +164,24 @@ func (dc *PerMessageDeflateConn) ReadMessage(buf []byte) ([]byte, OpCode, error)
 // an unfragmented frame with RSV1 set. Control frames bypass compression.
 func (dc *PerMessageDeflateConn) WriteMessage(op OpCode, payload []byte) error {
 	if op >= OpCodeClose {
-		return dc.c.WriteMessage(op, payload)
+		return dc.Conn.WriteMessage(op, payload)
 	}
 
-	dc.compBuf.Reset()
-	dc.compressor.Reset(&dc.compBuf)
+	comp, buf, compPtr := dc.acquireCompressor()
+	defer dc.releaseCompressor(buf, compPtr)
 
-	if _, err := dc.compressor.Write(payload); err != nil {
+	// no_context_takeover
+	comp.Reset(buf)
+
+	if _, err := comp.Write(payload); err != nil {
 		return err
 	}
-	if err := dc.compressor.Flush(); err != nil {
+
+	if err := comp.Flush(); err != nil {
 		return err
 	}
 
-	compressed := dc.compBuf.Bytes()
+	compressed := buf.Bytes()
 
 	if len(compressed) >= 4 &&
 		compressed[len(compressed)-4] == 0x00 &&
@@ -169,7 +191,7 @@ func (dc *PerMessageDeflateConn) WriteMessage(op OpCode, payload []byte) error {
 		compressed = compressed[:len(compressed)-4]
 	}
 
-	return dc.c.WriteFrame(true, rsv1Bit, op, compressed)
+	return dc.Conn.WriteFrame(true, rsv1Bit, op, compressed)
 }
 
 // StreamMessage reads raw data from r chunk-by-chunk, compresses it on the fly,
@@ -179,39 +201,53 @@ func (dc *PerMessageDeflateConn) StreamMessage(op OpCode, chunkSize int, r io.Re
 		return fmt.Errorf("%w: opcode(%d)", ErrInvalidOpCode, op)
 	}
 
-	if chunkSize > int(dc.c.maxChunkSize) {
-		return fmt.Errorf("%w: requested %d connection limit %d", ErrChunkSizeExceeded, chunkSize, dc.c.maxChunkSize)
+	if chunkSize > int(dc.Conn.maxFrameSize) {
+		return fmt.Errorf("%w: requested %d connection limit %d", ErrChunkSizeExceeded, chunkSize, dc.Conn.maxFrameSize)
 	}
 
-	bufA := make([]byte, chunkSize)
-	bufB := make([]byte, chunkSize)
+	var bufA, bufB []byte
+	if dc.Conn.streamBufPool != nil {
+		scratchPtr := dc.Conn.streamBufPool.Get()
+		defer dc.Conn.streamBufPool.Put(scratchPtr)
+
+		scratch := (*scratchPtr)[:cap(*scratchPtr)]
+
+		bufA = scratch[:chunkSize]
+		bufB = scratch[chunkSize : chunkSize*2]
+	} else {
+		bufA = make([]byte, chunkSize)
+		bufB = make([]byte, chunkSize)
+	}
 
 	nA, errA := r.Read(bufA)
 	if nA == 0 && errors.Is(errA, io.EOF) {
-		return dc.c.WriteFrame(true, rsv1Bit, op, nil)
+		return dc.Conn.WriteFrame(true, rsv1Bit, op, nil)
 	}
 
 	isFirst := true
 	currentBuf, nextBuf := bufA, bufB
 	nCurrent, errCurrent := nA, errA
 
-	dc.compBuf.Reset()
-	dc.compressor.Reset(&dc.compBuf)
+	comp, buf, compPtr := dc.acquireCompressor()
+	defer dc.releaseCompressor(buf, compPtr)
+
+	// no_context_takeover
+	comp.Reset(buf)
 
 	for {
 		// Look ahead to check if the current payload block is the final one
 		nNext, errNext := r.Read(nextBuf)
 		isFinal := (nNext == 0 && errors.Is(errNext, io.EOF))
 
-		// Compress the current chunk straight into the reusable destination buffer
-		if _, compErr := dc.compressor.Write(currentBuf[:nCurrent]); compErr != nil {
-			return compErr
-		}
-		if compErr := dc.compressor.Flush(); compErr != nil {
+		if _, compErr := comp.Write(currentBuf[:nCurrent]); compErr != nil {
 			return compErr
 		}
 
-		compressed := dc.compBuf.Bytes()
+		if compErr := comp.Flush(); compErr != nil {
+			return compErr
+		}
+
+		compressed := buf.Bytes()
 
 		if isFinal {
 			// Per RFC 7692, strip the 4-byte sync tail from the absolute end of the message payload
@@ -231,7 +267,7 @@ func (dc *PerMessageDeflateConn) StreamMessage(op OpCode, chunkSize int, r io.Re
 			currentRSV = 0
 		}
 
-		if err := dc.c.WriteFrame(isFinal, currentRSV, currentOp, compressed); err != nil {
+		if err := dc.Conn.WriteFrame(isFinal, currentRSV, currentOp, compressed); err != nil {
 			return err
 		}
 
@@ -247,15 +283,53 @@ func (dc *PerMessageDeflateConn) StreamMessage(op OpCode, chunkSize int, r io.Re
 		isFirst = false
 		currentBuf, nextBuf = nextBuf, currentBuf
 		nCurrent, errCurrent = nNext, errNext
-		dc.compBuf.Reset()
+
+		buf.Reset()
 	}
 }
 
 // Close terminates the active decompressor stream and shuts down the underlying connection.
 func (dc *PerMessageDeflateConn) Close() error {
-	if dc.decompressor != nil {
-		_ = dc.decompressor.Close()
+	if dc.boundCompressor != nil {
+		_ = dc.boundCompressor.Close()
 	}
 
-	return dc.c.Close()
+	return dc.Conn.Close()
+}
+
+// ==========================================
+//
+// ==========================================
+
+func (dc *PerMessageDeflateConn) acquireCompressor() (Compressor, *bytes.Buffer, *Compressor) {
+	if dc.compressorPool != nil {
+		compPtr := dc.compressorPool.Get()
+		buf := dc.compBufPool.Get()
+		return *compPtr, buf, compPtr
+	}
+	return dc.boundCompressor, dc.boundBuffer, nil
+}
+
+func (dc *PerMessageDeflateConn) releaseCompressor(buf *bytes.Buffer, compPtr *Compressor) {
+	buf.Reset()
+
+	if dc.compressorPool != nil && compPtr != nil {
+		dc.compBufPool.Put(buf)
+		dc.compressorPool.Put(compPtr)
+	}
+}
+
+func (dc *PerMessageDeflateConn) acquireDecompressor() (io.ReadCloser, *io.ReadCloser) {
+	if dc.decompressorPool != nil {
+		rcPtr := dc.decompressorPool.Get()
+		return *rcPtr, rcPtr
+	}
+
+	return dc.boundDecompressor, nil
+}
+
+func (dc *PerMessageDeflateConn) releaseDecompressor(rcPtr *io.ReadCloser) {
+	if dc.decompressorPool != nil && rcPtr != nil {
+		dc.decompressorPool.Put(rcPtr)
+	}
 }

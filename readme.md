@@ -23,8 +23,8 @@ The following metrics were captured on an Apple M1 Pro streaming 1 MB payloads o
 
 | Operation                         | Throughput | Allocations | Heap Churn |
 | --------------------------------- | ---------- | ----------- | ---------- |
-| `StreamMessageExt` (Raw TCP Path) | ~4.01 GB/s | 0 allocs/op | 0 B/op     |
-| `StreamMessage` (Deflate Path)    | ~770 MB/s  | 0 allocs/op | 0 B/op     |
+| `StreamMessageExt` (Raw TCP Path) | ~3.8 GB/s  | 0 allocs/op | 3 B/op     |
+| `StreamMessage` (Deflate Path)    | ~770 MB/s  | 0 allocs/op | 3 B/op     |
 
 *Note: The 3 setup allocations recorded during full benchmark runs represent the one-time initialization overhead of the test pipeline or the compression engine, not the hot-path loop execution.*
 

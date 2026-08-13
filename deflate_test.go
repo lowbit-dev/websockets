@@ -22,14 +22,14 @@ func TestDeflateWrapper_CompressedAndUncompressed(t *testing.T) {
 
 	go func() {
 		// Simulate a client that supports deflate
-		clientDeflate, _ := websockets.WrapDeflate(websockets.NewConnection(client, 4096, 0), flate.BestSpeed)
+		clientDeflate, _ := websockets.WrapDeflate(websockets.NewConn(client, 4096, 0), flate.BestSpeed)
 
 		// 1. Send a compressed message
 		_ = clientDeflate.WriteMessage(websockets.OpCodeText, []byte("compressed data payload"))
 
 		// 2. Send an uncompressed control/standard frame down the same wire
 		// (A standard client wrapper handles uncompressed bypass)
-		clientBase := websockets.NewConnection(client, 4096, 0)
+		clientBase := websockets.NewConn(client, 4096, 0)
 		_ = clientBase.WriteMessage(websockets.OpCodeText, []byte("raw uncompressed"))
 	}()
 
@@ -66,13 +66,15 @@ func TestDeflateStream_RSVMaskAndContextTakeover(t *testing.T) {
 	// internal sliding window history across chunk iterations.
 	repeatingData := bytes.Repeat([]byte("lowbit-streaming-test-string-"), 50) // ~1.5 KB
 
-	clientBase := websockets.NewConnection(clientConn, 4096, 0)
+	clientBase := websockets.NewConn(clientConn, 4096, 0)
 	clientDeflate, err := websockets.WrapDeflate(clientBase, flate.BestSpeed)
 	if err != nil {
 		t.Fatalf("failed to wrap client deflate: %v", err)
 	}
 
-	serverBase := websockets.NewConnection(serverConn, 4096, 0)
+	serverBase := websockets.NewConn(serverConn, 4096, 0)
+	serverBase.AssumeServerRole()
+
 	_, err = websockets.WrapDeflate(serverBase, flate.BestSpeed)
 	if err != nil {
 		t.Fatalf("failed to wrap server deflate: %v", err)
@@ -140,10 +142,11 @@ func TestDeflateStream_EndToEndReadVerification(t *testing.T) {
 	defer clientConn.Close()
 	defer serverConn.Close()
 
-	clientBase := websockets.NewConnection(clientConn, 4096, 0)
+	clientBase := websockets.NewConn(clientConn, 4096, 0)
 	clientDeflate, _ := websockets.WrapDeflate(clientBase, flate.BestSpeed)
 
-	serverBase := websockets.NewConnection(serverConn, 4096, 0)
+	serverBase := websockets.NewConn(serverConn, 4096, 0)
+	serverBase.AssumeServerRole() // <-- This is structurally necessary for the engine to work!
 	serverDeflate, _ := websockets.WrapDeflate(serverBase, flate.BestSpeed)
 
 	originPayload := []byte("asserting that chunked compression inflates cleanly back to normal text")

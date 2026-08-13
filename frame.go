@@ -1,26 +1,10 @@
 package websockets
 
 import (
+	"crypto/rand"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
-)
-
-var (
-	// ErrInvalidOpCode is returned when a frame arrives with an unrecognized
-	// or unallocated opcode bit configuration, violating RFC 6455 framing definitions.
-	ErrInvalidOpCode = errors.New("invalid opcode")
-
-	// ErrControlFramePayloadTooLarge is returned when a control frame (such as Ping,
-	// Pong, or Close) arrives carrying a payload greater than 125 bytes, violating
-	// the strict length boundary defined in RFC 6455 Section 5.5.
-	ErrControlFramePayloadTooLarge = errors.New("control frame payload exceeds 125 bytes")
-
-	// ErrFrameBufferTooSmall is returned when a slice provided to a low-level frame
-	// reader function lacks the capacity or length necessary to ingest the incoming
-	// frame's payload body without overflowing.
-	ErrFrameBufferTooSmall = errors.New("provided buffer capacity too small for frame payload")
 )
 
 // OpCode represents the type of a WebSocket frame as defined by RFC 6455.
@@ -100,6 +84,14 @@ func (c *Conn) ReadHeader() (Header, error) {
 	opCode := OpCode(hBuf[0] & 0x0F)
 	isMasked := (hBuf[1] & maskBit) != 0
 	payloadLen := int64(hBuf[1] & 0x7F)
+
+	if c.isServer && !isMasked {
+		return Header{}, ErrUnmaskedClientFrame
+	}
+
+	if !c.isServer && isMasked {
+		return Header{}, ErrMaskedServerFrame
+	}
 
 	// Decode extended lengths sequentially from the wire
 	switch payloadLen {
@@ -192,7 +184,7 @@ func (c *Conn) ReadFrame(p []byte) (Frame, error) {
 			return Frame{}, err
 		}
 		if isMasked {
-			unmask(payload, maskKey)
+			applyMask(payload, maskKey)
 		}
 	}
 
@@ -209,59 +201,104 @@ func (c *Conn) ReadFrame(p []byte) (Frame, error) {
 // It uses the underlying buffered writer to minimize system calls and flushes immediately.
 // It exposes the rsv byte (e.g., 0x40 for RSV1) so callers can implement extensions.
 func (c *Conn) WriteFrame(isFinal bool, rsv byte, op OpCode, payload []byte) error {
+	if op >= OpCodeClose && len(payload) > 125 {
+		return fmt.Errorf("%w: %d bytes (control frame limit %d)", ErrFrameTooLarge, len(payload), 125)
+	}
+
 	var firstByte byte
 	if isFinal {
 		firstByte |= 0x80
 	}
 
+	bufPtr := c.writeBufPool.Get()
+	defer c.writeBufPool.Put(bufPtr)
+
+	buf := (*bufPtr)[:cap(*bufPtr)]
+
 	firstByte |= (rsv & 0x70) // Mask out everything but RSV1, RSV2, RSV3
 	firstByte |= byte(op & 0x0F)
 
-	c.writeBuf[0] = firstByte
+	buf[0] = firstByte
 
 	payloadLen := len(payload)
 	headerLen := 2
 
 	if payloadLen <= 125 {
-		c.writeBuf[1] = byte(payloadLen) // Server frames do not mask data
+		buf[1] = byte(payloadLen) // Server frames do not mask data
 	} else if payloadLen <= 65535 {
-		c.writeBuf[1] = 126
-		c.writeBuf[2] = byte(payloadLen >> 8)
-		c.writeBuf[3] = byte(payloadLen)
+		buf[1] = 126
+		buf[2] = byte(payloadLen >> 8)
+		buf[3] = byte(payloadLen)
 		headerLen = 4
 	} else {
-		c.writeBuf[1] = 127
-		c.writeBuf[2] = byte(payloadLen >> 56)
-		c.writeBuf[3] = byte(payloadLen >> 48)
-		c.writeBuf[4] = byte(payloadLen >> 40)
-		c.writeBuf[5] = byte(payloadLen >> 32)
-		c.writeBuf[6] = byte(payloadLen >> 24)
-		c.writeBuf[7] = byte(payloadLen >> 16)
-		c.writeBuf[8] = byte(payloadLen >> 8)
-		c.writeBuf[9] = byte(payloadLen)
+		buf[1] = 127
+		buf[2] = byte(payloadLen >> 56)
+		buf[3] = byte(payloadLen >> 48)
+		buf[4] = byte(payloadLen >> 40)
+		buf[5] = byte(payloadLen >> 32)
+		buf[6] = byte(payloadLen >> 24)
+		buf[7] = byte(payloadLen >> 16)
+		buf[8] = byte(payloadLen >> 8)
+		buf[9] = byte(payloadLen)
 		headerLen = 10
 	}
 
-	copy(c.writeBuf[headerLen:], payload)
-
-	if c.writeTCP != nil {
-		_, err := c.writeTCP.Write(c.writeBuf[:headerLen+payloadLen])
-		return err
-	} else if c.writeTLS != nil {
-		_, err := c.writeTLS.Write(c.writeBuf[:headerLen+payloadLen])
-		return err
-	} else {
-		_, err := c.underlying.Write(c.writeBuf[:headerLen+payloadLen])
-		return err
+	maskOffset := 0
+	if !c.isServer {
+		buf[1] |= maskBit
+		maskOffset = 4
 	}
+
+	frameLength := headerLen + maskOffset + payloadLen
+	if int64(frameLength) > c.maxFrameSize {
+		return fmt.Errorf("%w: %d bytes (limit %d)", ErrFrameTooLarge, len(payload), c.maxFrameSize)
+	}
+
+	if c.isServer {
+		copy(buf[headerLen:], payload)
+	} else {
+		maskKey := buf[headerLen : headerLen+4]
+		_, _ = rand.Read(maskKey)
+
+		target := buf[headerLen+4 : frameLength]
+		copy(target, payload)
+
+		applyMask(target, [4]byte{maskKey[0], maskKey[1], maskKey[2], maskKey[3]})
+	}
+
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
+	var err error
+	if c.writeTCP != nil {
+		_, err = c.writeTCP.Write(buf[:frameLength])
+	} else if c.writeTLS != nil {
+		_, err = c.writeTLS.Write(buf[:frameLength])
+	} else {
+		_, err = c.underlying.Write(buf[:frameLength])
+	}
+
+	return err
 }
 
-// unmask applies the RFC 6455 XOR mask to the payload in-place.
-// It requires zero allocations, satisfying the requirement to design for the runtime.
-func unmask(payload []byte, maskKey [4]byte) {
-	// For smaller payloads, a standard loop is perfectly traceable and fast.
-	// The Go compiler is smart enough to optimize i%4 (or i&3) into fast bitwise ops.
-	for i := 0; i < len(payload); i++ {
-		payload[i] ^= maskKey[i&3] // i&3 is functionally identical to i%4 but faster
+// applyMask applies the XOR mask to the payload in-place.
+func applyMask(payload []byte, maskKey [4]byte) {
+	n := len(payload)
+	if n == 0 {
+		return
+	}
+
+	m32 := binary.LittleEndian.Uint32(maskKey[:])
+	m64 := uint64(m32)<<32 | uint64(m32)
+
+	i := 0
+	for i+8 <= n {
+		chunk := binary.LittleEndian.Uint64(payload[i : i+8])
+		binary.LittleEndian.PutUint64(payload[i:i+8], chunk^m64)
+		i += 8
+	}
+
+	for ; i < n; i++ {
+		payload[i] ^= maskKey[i&3]
 	}
 }

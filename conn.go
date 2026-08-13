@@ -9,37 +9,10 @@ import (
 	"io"
 	"net"
 	"slices"
+	"sync"
+	"sync/atomic"
 	"time"
-)
-
-var (
-	// ErrMessageTooBig is returned when an incoming message's total payload size
-	// exceeds the configured maxReadLimit boundary to prevent out-of-memory vectors.
-	ErrMessageTooBig = errors.New("message exceeds max read limit")
-
-	// ErrProtocolReservedBits is returned when a frame arrives with its RSV1, RSV2,
-	// or RSV3 bits set without an explicit extension (like permessage-deflate)
-	// having negotiated their use during the handshake.
-	ErrProtocolReservedBits = errors.New("protocol error, reserved bits must be 0")
-
-	// ErrWebSocketClosed is returned when a read or write operation is attempted
-	// on a connection that has already completed its closure handshake or has
-	// been physically severed.
-	ErrWebSocketClosed = errors.New("websocket closed")
-
-	// ErrUnexpectedContinuation is returned when a continuation frame is received
-	// on the wire but no fragmented message sequence was currently in progress.
-	ErrUnexpectedContinuation = errors.New("protocol error, unexpected continuation frame")
-
-	// ErrExpectedContinuation is returned when a new message initiator frame is
-	// received before the prior fragmented frame sequence was properly concluded
-	// with a final (FIN=true) continuation frame.
-	ErrExpectedContinuation = errors.New("protocol error, expected continuation frame")
-
-	// ErrChunkSizeExceeded is returned when a streaming operation requests a chunk
-	// size that is larger than the pre-allocated maxChunkSize limit defined
-	// during connection initialization.
-	ErrChunkSizeExceeded = errors.New("requested chunk size exceeds connection limit")
+	"unicode/utf8"
 )
 
 // CloseCode represents a WebSocket close status code as defined by RFC 6455.
@@ -108,39 +81,47 @@ const (
 	// raw image uploads, file attachments, or dense data arrays.
 	ReadLimitLarge = 16 * 1024 * 1024
 
-	// ChunkSizeLowMemory (4 KB) minimizes the per-connection RAM footprint.
+	// FrameSizeLowMemory (4 KB) minimizes the per-connection RAM footprint.
 	// Aligns with standard OS virtual memory pages and fits well within common
 	// network MTU boundaries. Best for high-concurrency systems like chat,
 	// notifications, or IoT gateways.
-	ChunkSizeLowMemory = 4096
+	FrameSizeLowMemory = 4096
 
-	// ChunkSizeBalanced (8 KB) provides a middle ground for typical web applications
+	// FrameSizeBalanced (8 KB) provides a middle ground for typical web applications
 	// transferring medium-sized text or JSON payloads.
-	ChunkSizeBalanced = 8192
+	FrameSizeBalanced = 8192
 
-	// ChunkSizeStreaming (32 KB) maximizes processing throughput for heavy file
+	// FrameSizeStreaming (32 KB) maximizes processing throughput for heavy file
 	// transfers or compressed data lines. This matches the internal sliding
 	// history window of the DEFLATE algorithm and standard io.Copy buffers.
-	ChunkSizeStreaming = 32768
+	FrameSizeStreaming = 32768
 )
 
-type PingHandler func([]byte) error
-type PongHandler func([]byte) error
-type CloseHandler func(CloseCode, []byte)
+type PingHandler func(payload []byte) error
+type PongHandler func(payload []byte) error
+type CloseHandler func(code CloseCode, text []byte)
 
 // Conn represents an active RFC 6455 WebSocket connection.
 type Conn struct {
 	underlying net.Conn
+	ctx        context.Context
+	ctxCancel  context.CancelCauseFunc
+
+	isServer     bool
+	validateUTF8 bool
+	maxReadLimit int64
+	maxFrameSize int64
+
+	subprotocol string
 
 	// fast path
 	writeTCP *net.TCPConn
 	writeTLS *tls.Conn
 
-	writeBuf []byte
-
-	// maxReadLimit protects the server from OOM attacks during continuation frame assembly.
-	maxReadLimit int64
-	maxChunkSize int64
+	writeMu       sync.Mutex
+	closeSent     atomic.Bool
+	writeBufPool  *TypedPool[[]byte]
+	streamBufPool *TypedPool[[]byte]
 
 	// pingHandler is invoked synchronously when a Ping frame is read.
 	pingHandler  PingHandler
@@ -153,21 +134,29 @@ type Conn struct {
 // protecting the runtime from out-of-memory vulnerabilities.
 // if maxReadLimit is 0, the default of ReadLimitStandard (1MB) will be applied
 // if maxChunkSize is 0, the default of ChunkSizeLowMemory (4KB) will be applied
-func NewConnection(conn net.Conn, maxReadLimit int64, maxChunkSize int64) *Conn {
+func NewConn(conn net.Conn, maxReadLimit int64, maxFrameSize int64) *Conn {
 	if maxReadLimit == 0 {
 		maxReadLimit = ReadLimitStandard
 	}
 
-	if maxChunkSize == 0 {
-		maxChunkSize = ChunkSizeLowMemory
+	if maxFrameSize == 0 {
+		maxFrameSize = FrameSizeLowMemory
 	}
 
+	ctx, cancel := context.WithCancelCause(context.Background())
+
 	c := &Conn{
-		underlying:   conn,
+		underlying: conn,
+		ctx:        ctx,
+		ctxCancel:  cancel,
+
 		maxReadLimit: maxReadLimit,
-		maxChunkSize: maxChunkSize,
+		maxFrameSize: maxFrameSize,
 		closeHandler: func(oc CloseCode, b []byte) {},
-		writeBuf:     make([]byte, 14+maxChunkSize),
+		writeBufPool: NewTypedPool(func() *[]byte {
+			buf := make([]byte, 4+maxFrameSize)
+			return &buf
+		}),
 	}
 
 	if tcp, ok := conn.(*net.TCPConn); ok {
@@ -184,7 +173,38 @@ func NewConnection(conn net.Conn, maxReadLimit int64, maxChunkSize int64) *Conn 
 		return nil
 	}
 
+	c.closeHandler = func(cc CloseCode, b []byte) {}
+
 	return c
+}
+
+func (c *Conn) Context() context.Context {
+	return c.ctx
+}
+
+func (c *Conn) AssumeServerRole() {
+	c.isServer = true
+}
+
+func (c *Conn) AssumeClientRole() {
+	c.isServer = false
+}
+
+func (c *Conn) Subprotocol() string { return c.subprotocol }
+func (c *Conn) SetSubprotocol(proto string) {
+	c.subprotocol = proto
+}
+
+// SetReadDeadline sets the deadline for future Read calls.
+// A zero value for t means Read will not time out.
+func (c *Conn) SetReadDeadline(t time.Time) error {
+	return c.underlying.SetReadDeadline(t)
+}
+
+// SetWriteDeadline sets the deadline for future Write calls.
+// A zero value for t means Write will not time out.
+func (c *Conn) SetWriteDeadline(t time.Time) error {
+	return c.underlying.SetWriteDeadline(t)
 }
 
 // SetPingHandler allows callers to inject application logic (e.g., heartbeats).
@@ -253,7 +273,7 @@ func (c *Conn) ReadMessageExt(buf []byte) ([]byte, OpCode, byte, error) {
 			}
 
 			if header.IsMasked {
-				unmask(targetBuf, header.MaskKey)
+				applyMask(targetBuf, header.MaskKey)
 			}
 		}
 
@@ -261,26 +281,44 @@ func (c *Conn) ReadMessageExt(buf []byte) ([]byte, OpCode, byte, error) {
 		if header.Op >= OpCodeClose {
 			switch header.Op {
 			case OpCodePing:
-				if err := c.pingHandler(targetBuf); err != nil {
-					return buf, 0, rsv, err
+				if c.pingHandler != nil {
+					if err := c.pingHandler(targetBuf); err != nil {
+						return buf, 0, rsv, err
+					}
 				}
 
 				continue
 			case OpCodePong:
-				if err := c.pongHandler(targetBuf); err != nil {
-					return buf, 0, rsv, err
+				if c.pongHandler != nil {
+					if err := c.pongHandler(targetBuf); err != nil {
+						return buf, 0, rsv, err
+					}
 				}
 
 				continue
 			case OpCodeClose:
 				var code uint16 = 1000
 				var text []byte
+
 				if len(targetBuf) >= 2 {
 					code = binary.BigEndian.Uint16(targetBuf[:2])
 					text = targetBuf[2:]
 				}
 
-				c.closeHandler(CloseCode(code), text)
+				// Echo back the close frame only if we haven't sent one yet.
+				// CloseWithCode checks this flag too, preventing a double close
+				// when defer wsConn.Close() runs after the read loop exits.
+				if !c.closeSent.Swap(true) {
+					_ = c.WriteMessage(OpCodeClose, targetBuf)
+				}
+
+				if c.ctxCancel != nil {
+					c.ctxCancel(fmt.Errorf("client closed connection with code %d", code))
+				}
+
+				if c.closeHandler != nil {
+					c.closeHandler(CloseCode(code), text)
+				}
 
 				return buf, 0, rsv, fmt.Errorf("%w: %d", ErrWebSocketClosed, code)
 			}
@@ -306,6 +344,12 @@ func (c *Conn) ReadMessageExt(buf []byte) ([]byte, OpCode, byte, error) {
 		}
 	}
 
+	if c.validateUTF8 && firstOpCode == OpCodeText {
+		if !utf8.Valid(buf) {
+			return buf, firstOpCode, rsv, ErrInvalidUTF8
+		}
+	}
+
 	return buf, firstOpCode, rsv, nil
 }
 
@@ -323,12 +367,24 @@ func (c *Conn) StreamMessageExt(op OpCode, rsv byte, chunkSize int, r io.Reader)
 		return fmt.Errorf("%w: opcode(%d)", ErrInvalidOpCode, op)
 	}
 
-	if chunkSize > int(c.maxChunkSize) {
-		return fmt.Errorf("%w: requested %d connection limit %d", ErrChunkSizeExceeded, chunkSize, c.maxChunkSize)
+	headerLen := 2
+	if chunkSize > 65535 {
+		headerLen = 10
+	} else if chunkSize > 125 {
+		headerLen = 4
 	}
 
-	bufA := make([]byte, chunkSize)
-	bufB := make([]byte, chunkSize)
+	if !c.isServer {
+		headerLen += 4
+	}
+
+	if chunkSize+headerLen > int(c.maxFrameSize) {
+		return fmt.Errorf("%w: requested chunk size %d plus header (%d bytes) exceeds connection limit %d",
+			ErrChunkSizeExceeded, chunkSize, headerLen, c.maxFrameSize)
+	}
+
+	bufA, bufB, scratchPtr := c.acquireStreamBuffer(chunkSize)
+	defer c.releaseStreamBuffer(scratchPtr)
 
 	// Ingest the initial chunk up front
 	nA, errA := r.Read(bufA)
@@ -378,16 +434,19 @@ func (c *Conn) StreamMessage(op OpCode, chunkSize int, r io.Reader) error {
 // CloseWithCode sends a specific RFC 6455 closure status code before
 // severing the underlying network connection.
 func (c *Conn) CloseWithCode(code CloseCode) error {
-	// Stack-allocate the standard 2-byte closure payload.
-	var payload [2]byte
-	binary.BigEndian.PutUint16(payload[:], uint16(code))
+	// Only send a close frame if we haven't already (e.g. echoed one in ReadMessageExt).
+	// This prevents the client from receiving two close frames when the session read
+	// loop exits after echoing the client's close and defer wsConn.Close() also fires.
+	if !c.closeSent.Swap(true) {
+		var payload [2]byte
+		binary.BigEndian.PutUint16(payload[:], uint16(code))
+		_ = c.WriteMessage(OpCodeClose, payload[:])
+	}
 
-	// Attempt to gracefully notify the client.
-	// We ignore the error because network state during teardown is highly
-	// volatile, and we are closing the socket immediately regardless.
-	_ = c.WriteMessage(OpCodeClose, payload[:])
+	if c.ctxCancel != nil {
+		c.ctxCancel(fmt.Errorf("connection closed with code %d", code))
+	}
 
-	// Sever the underlying connection to free the file descriptor.
 	return c.underlying.Close()
 }
 
@@ -421,5 +480,30 @@ func (c *Conn) KeepAlive(ctx context.Context, interval time.Duration) error {
 				return err
 			}
 		}
+	}
+}
+
+// ==========================================
+//
+// ==========================================
+
+// acquireStreamBuffer fetches a double-capacity buffer and slices it into bufA and bufB.
+func (c *Conn) acquireStreamBuffer(chunkSize int) ([]byte, []byte, *[]byte) {
+	if c.streamBufPool != nil {
+		scratchPtr := c.streamBufPool.Get()
+		scratch := (*scratchPtr)[:cap(*scratchPtr)]
+
+		bufA := scratch[:chunkSize]
+		bufB := scratch[chunkSize : chunkSize*2]
+		return bufA, bufB, scratchPtr
+	}
+
+	// Standalone fallback
+	return make([]byte, chunkSize), make([]byte, chunkSize), nil
+}
+
+func (c *Conn) releaseStreamBuffer(scratchPtr *[]byte) {
+	if c.streamBufPool != nil && scratchPtr != nil {
+		c.streamBufPool.Put(scratchPtr)
 	}
 }

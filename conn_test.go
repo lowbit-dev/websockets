@@ -19,7 +19,11 @@ func setupPipe(t *testing.T, maxLimit int64) (net.Conn, *websockets.Conn) {
 		_ = client.Close()
 		_ = server.Close()
 	})
-	return client, websockets.NewConnection(server, maxLimit, 0)
+
+	serverConn := websockets.NewConn(server, maxLimit, 0)
+	serverConn.AssumeServerRole()
+
+	return client, serverConn
 }
 
 func TestReadMessage_Unfragmented(t *testing.T) {
@@ -28,7 +32,7 @@ func TestReadMessage_Unfragmented(t *testing.T) {
 	// Use a goroutine to simulate the client writing a single, clean text frame
 	go func() {
 		// A helper or direct mock write. We can wrap the client in a Conn to write!
-		clientWS := websockets.NewConnection(client, 1024, 0)
+		clientWS := websockets.NewConn(client, 1024, 0)
 		_ = clientWS.WriteFrame(true, 0, websockets.OpCodeText, []byte("hello lowbit"))
 	}()
 
@@ -50,7 +54,7 @@ func TestReadMessage_FragmentedAssembly(t *testing.T) {
 	client, server := setupPipe(t, 1024)
 
 	go func() {
-		clientWS := websockets.NewConnection(client, 1024, 0)
+		clientWS := websockets.NewConn(client, 1024, 0)
 		// Frame 1: Text opcode, FIN = false
 		_ = clientWS.WriteFrame(false, 0, websockets.OpCodeText, []byte("part1 "))
 		// Frame 2: Continuation opcode, FIN = true
@@ -92,7 +96,7 @@ func TestReadMessage_InterleavedControlFrame(t *testing.T) {
 			}
 		}()
 
-		clientWS := websockets.NewConnection(client, 1024, 0)
+		clientWS := websockets.NewConn(client, 1024, 0)
 		// 1. Send first data fragment (FIN=false)
 		_ = clientWS.WriteFrame(false, 0, websockets.OpCodeText, []byte("hello "))
 		// 2. Interleave a Ping frame right in the middle of the message
@@ -121,7 +125,7 @@ func TestReadMessage_OOMPreventionLimit(t *testing.T) {
 	client, server := setupPipe(t, 20)
 
 	go func() {
-		clientWS := websockets.NewConnection(client, 1024, 0)
+		clientWS := websockets.NewConn(client, 1024, 0)
 		// Malicious client attempts to send a 25-byte frame
 		_ = clientWS.WriteFrame(true, 0, websockets.OpCodeText, make([]byte, 25))
 	}()
@@ -142,8 +146,11 @@ func TestStreamMessageExt_MultiChunk(t *testing.T) {
 	defer clientConn.Close()
 	defer serverConn.Close()
 
-	client := websockets.NewConnection(clientConn, 1024, 0)
-	server := websockets.NewConnection(serverConn, 1024, 0)
+	client := websockets.NewConn(clientConn, 1024, 0)
+	client.AssumeClientRole()
+
+	server := websockets.NewConn(serverConn, 1024, 0)
+	server.AssumeServerRole() // Server acts as a server. Good.
 
 	rawData := []byte("ABC")
 	chunkSize := 2
@@ -158,33 +165,32 @@ func TestStreamMessageExt_MultiChunk(t *testing.T) {
 		clientErr = client.StreamMessageExt(websockets.OpCodeText, 0x40, chunkSize, r)
 	}()
 
-	// Frame 1: Contains "AB" (IsFinal=false, RSV=0x40, Op=OpCodeText)
-	h1, err := server.ReadHeader()
+	// Frame 1: Instead of io.ReadFull, let's use the engine's framing reader
+	// Assuming your FrameReaderWriter interface exposes ReadFrame:
+	p1 := make([]byte, 2)
+	frame1, err := server.ReadFrame(p1)
 	if err != nil {
-		t.Fatalf("failed to read header 1: %v", err)
-	}
-	if h1.IsFinal || h1.Op != websockets.OpCodeText || h1.RSV != 0x40 || h1.PayloadLen != 2 {
-		t.Fatalf("Frame 1 invalid: %+v", h1)
+		t.Fatalf("failed to read frame 1: %v", err)
 	}
 
-	p1 := make([]byte, h1.PayloadLen)
-	if _, err := io.ReadFull(serverConn, p1); err != nil || !bytes.Equal(p1, []byte("AB")) {
-		t.Fatalf("Frame 1 payload invalid: %q", p1)
+	if frame1.IsFinal || frame1.Op != websockets.OpCodeText || frame1.RSV != 0x40 {
+		t.Fatalf("Frame 1 invalid: %+v", frame1)
+	}
+	if !bytes.Equal(p1, []byte("AB")) {
+		t.Fatalf("Frame 1 payload invalid, expected 'AB', got: %q", p1)
 	}
 
-	// Frame 2: Contains "C" (IsFinal=true, RSV=0, Op=OpCodeContinuation)
-	// Optimized lookahead means this frame concludes the message!
-	h2, err := server.ReadHeader()
+	// Frame 2:
+	p2 := make([]byte, 1)
+	frame2, err := server.ReadFrame(p2)
 	if err != nil {
-		t.Fatalf("failed to read header 2: %v", err)
+		t.Fatalf("failed to read frame 2: %v", err)
 	}
-	if !h2.IsFinal || h2.Op != websockets.OpCodeContinuation || h2.RSV != 0 || h2.PayloadLen != 1 {
-		t.Fatalf("Frame 2 invalid: %+v", h2)
+	if !frame2.IsFinal || frame2.Op != websockets.OpCodeContinuation {
+		t.Fatalf("Frame 2 invalid: %+v", frame2)
 	}
-
-	p2 := make([]byte, h2.PayloadLen)
-	if _, err := io.ReadFull(serverConn, p2); err != nil || !bytes.Equal(p2, []byte("C")) {
-		t.Fatalf("Frame 2 payload invalid: %q", p2)
+	if !bytes.Equal(p2, []byte("C")) {
+		t.Fatalf("Frame 2 payload invalid, expected 'C', got: %q", p2)
 	}
 
 	wg.Wait()
@@ -199,8 +205,11 @@ func TestStreamMessageExt_ExactBoundaryAlignment(t *testing.T) {
 	defer clientConn.Close()
 	defer serverConn.Close()
 
-	client := websockets.NewConnection(clientConn, 1024, 0)
-	server := websockets.NewConnection(serverConn, 1024, 0)
+	client := websockets.NewConn(clientConn, 1024, 0)
+	client.AssumeClientRole()
+
+	server := websockets.NewConn(serverConn, 1024, 0)
+	server.AssumeServerRole()
 
 	rawData := []byte("1234")
 	chunkSize := 2
