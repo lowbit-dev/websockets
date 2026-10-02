@@ -3,6 +3,7 @@ package websockets
 import (
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 )
@@ -51,6 +52,10 @@ const (
 	// When set, it indicates that the payload data is masked and
 	// is followed by a 4-byte masking key.
 	maskBit byte = 1 << 7
+)
+
+var (
+	ErrConnectionIsNil = errors.New("can not write to a nill connection")
 )
 
 // Frame represents the raw metadata of an individual RFC 6455 frame.
@@ -274,8 +279,10 @@ func (c *Conn) WriteFrame(isFinal bool, rsv byte, op OpCode, payload []byte) err
 		_, err = c.writeTCP.Write(buf[:frameLength])
 	} else if c.writeTLS != nil {
 		_, err = c.writeTLS.Write(buf[:frameLength])
-	} else {
+	} else if c.underlying != nil {
 		_, err = c.underlying.Write(buf[:frameLength])
+	} else {
+		return ErrConnectionIsNil
 	}
 
 	return err
